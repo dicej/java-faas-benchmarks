@@ -12,18 +12,40 @@ mod tests {
             signature::{JavaType, Primitive},
             InitArgsBuilder, JNIVersion, JavaVM,
         },
-        std::env,
+        lazy_static::lazy_static,
+        std::process,
         test::Bencher,
+        wasmtime::{Config, Engine, Linker, Module, Store},
+        wasmtime_wasi::{WasiCtx, WasiCtxBuilder},
     };
 
-    fn bench_jvm(bencher: &mut Bencher, class_name: &str, arguments: &[&str]) -> Result<()> {
-        let jvm = JavaVM::new(
-            InitArgsBuilder::new()
-                .version(JNIVersion::V8)
-                .option(&format!("-Djava.class.path={}", env::var("CLASSPATH")?))
-                .build()?,
-        )?;
-        let env = jvm.attach_current_thread()?;
+    fn bench_jvm(
+        bencher: &mut Bencher,
+        class_name: &str,
+        arguments: &[&str],
+        fork: bool,
+    ) -> Result<()> {
+        lazy_static! {
+            static ref JVM: JavaVM = JavaVM::new(
+                InitArgsBuilder::new()
+                    .version(JNIVersion::V8)
+                    .option(
+                        "-Djava.class.path=\
+                         apps/mandelbrot/target/classes:\
+                         apps/nbody/target/classes:\
+                         apps/pidigits/target/classes:\
+                         apps/spectralnorm/target/classes:\
+                         apps/simple/target/classes:\
+                         apps/hello/target/classes"
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let env = JVM.attach_current_thread()?;
+
         env.call_static_method(
             "java/lang/System",
             "setOut",
@@ -42,40 +64,118 @@ mod tests {
 
         let class = env.find_class(class_name)?;
         let method = env.get_static_method_id(class, "main", "([Ljava/lang/String;)V")?;
-        let args = env.new_object_array(
-            arguments.len().try_into()?,
-            "java/lang/String",
-            JObject::null(),
-        )?;
-        for (index, argument) in arguments.iter().enumerate() {
-            env.set_object_array_element(args, index.try_into()?, env.new_string(argument)?)?;
-        }
 
-        bencher.iter(|| {
+        let test = || {
+            let args = env
+                .new_object_array(
+                    arguments.len().try_into().unwrap(),
+                    "java/lang/String",
+                    JObject::null(),
+                )
+                .unwrap();
+
+            for (index, argument) in arguments.iter().enumerate() {
+                env.set_object_array_element(
+                    args,
+                    index.try_into().unwrap(),
+                    env.new_string(argument).unwrap(),
+                )
+                .unwrap();
+            }
+
             env.call_static_method_unchecked(
                 class,
                 method,
                 JavaType::Primitive(Primitive::Void),
-                &[JValue::Object(JObject::from(args))],
+                &[JValue::Object(args.into())],
             )
             .unwrap();
+        };
+
+        if fork {
+            bencher.iter(|| {
+                match unsafe { libc::fork() } {
+                    -1 => panic!("fork failed; errno: {}", errno::errno()),
+                    0 => {
+                        // I'm the child
+                        test();
+                        process::exit(0);
+                    }
+                    child => {
+                        // I'm the parent
+                        let mut status = 0;
+                        if -1 == unsafe { libc::waitpid(child, &mut status, 0) } {
+                            panic!("waitpid failed; errno: {}", errno::errno());
+                        }
+
+                        if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+                            panic!(
+                                "child exited{}",
+                                if libc::WIFEXITED(status) {
+                                    format!(" (exit status {})", libc::WEXITSTATUS(status))
+                                } else if libc::WIFSIGNALED(status) {
+                                    format!(" (killed by signal {})", libc::WTERMSIG(status))
+                                } else {
+                                    String::new()
+                                }
+                            )
+                        }
+                    }
+                }
+            });
+        } else {
+            bencher.iter(test);
+        }
+
+        Ok(())
+    }
+
+    fn bench_teavm(bencher: &mut Bencher, class_name: &str, arguments: &[&str]) -> Result<()> {
+        let engine = &Engine::new(&Config::new())?;
+        let module = &Module::from_file(
+            engine,
+            &format!("apps/{class_name}/target/generated/wasm/teavm-wasm/classes.wasm.opt"),
+        )?;
+        let linker = &mut Linker::<WasiCtx>::new(engine);
+        wasmtime_wasi::add_to_linker(linker, |context| context)?;
+        linker.func_wrap("teavmMath", "log", f64::ln)?;
+        linker.func_wrap("teavmMath", "sqrt", f64::sqrt)?;
+
+        let store = &mut Store::new(engine, WasiCtxBuilder::new().arg("<wasm module>")?.build());
+        let instance_pre = linker.instantiate_pre(store, module)?;
+
+        bencher.iter(|| {
+            let store = &mut Store::new(
+                engine,
+                WasiCtxBuilder::new().arg("<wasm module>").unwrap().build(),
+            );
+
+            for argument in arguments {
+                store.data_mut().push_arg(argument).unwrap();
+            }
+
+            let instance = instance_pre.instantiate(&mut *store).unwrap();
+
+            let func = instance
+                .get_typed_func::<(), (), _>(&mut *store, "_start")
+                .unwrap();
+
+            func.call(&mut *store, ()).unwrap()
         });
 
         Ok(())
     }
 
-    fn bench_teavm(bencher: &mut Bencher, _class_name: &str, _arguments: &[&str]) -> Result<()> {
-        // TODO
-        bencher.iter(|| ());
-
-        Ok(())
-    }
-
     macro_rules! benchmarks {
-        ($($jvm:ident $teavm:ident $name:literal $($args:literal)*,)*) => ($(
+        ($($jvm:ident $jvm_fork:ident $teavm:ident $name:literal $($args:literal)*,)*) => ($(
             #[bench]
             fn $jvm(bencher: &mut Bencher) -> Result<()> {
-                bench_jvm(bencher, $name, &[$($args,)*])
+                bench_jvm(bencher, $name, &[$($args,)*], false)
+            }
+
+            #[bench]
+            fn $jvm_fork(bencher: &mut Bencher) -> Result<()> {
+                bench_jvm(bencher, $name, &[$($args,)*], true)
             }
 
             #[bench]
@@ -86,10 +186,11 @@ mod tests {
     }
 
     benchmarks! {
-        jvm_mandelbrot teavm_mandelbrot "mandelbrot" "200",
-        jvm_nbody teavm_nbody "nbody" "10000",
-        jvm_pidigits teavm_pidigits "pidigits" "10000",
-        jvm_spectralnorm teavm_spectralnorm "spectralnorm" "100",
-        jvm_simple teavm_simple "simple" "200",
+        jvm_mandelbrot jvm_fork_mandelbrot teavm_mandelbrot "mandelbrot" "200",
+        jvm_nbody jvm_fork_nbody teavm_nbody "nbody" "10000",
+        jvm_pidigits jvm_fork_pidigits teavm_pidigits "pidigits" "100",
+        jvm_spectralnorm jvm_fork_spectralnorm teavm_spectralnorm "spectralnorm" "100",
+        jvm_simple jvm_fork_simple teavm_simple "simple" "200",
+        jvm_hello jvm_fork_hello teavm_hello "hello" "hello, world!",
     }
 }

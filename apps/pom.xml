@@ -15,6 +15,7 @@
     <module>pidigits</module>
     <module>spectralnorm</module>
     <module>simple</module>
+    <module>hello</module>
   </modules>
 
 </project>
