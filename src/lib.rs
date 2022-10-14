@@ -7,17 +7,56 @@ extern crate test;
 mod tests {
     use {
         anyhow::Result,
+        dlopen::wrapper::{Container, WrapperApi},
+        dlopen_derive::WrapperApi,
+        gag::Gag,
         jni::{
             objects::{JObject, JValue},
             signature::{JavaType, Primitive},
             InitArgsBuilder, JNIVersion, JavaVM,
         },
         lazy_static::lazy_static,
-        std::process,
+        std::{
+            ffi::{c_char, c_int, CString},
+            iter, process,
+        },
         test::Bencher,
         wasmtime::{Config, Engine, Linker, Module, Store},
         wasmtime_wasi::{WasiCtx, WasiCtxBuilder},
     };
+
+    fn do_fork(fun: impl Fn()) -> impl Fn() {
+        move || {
+            match unsafe { libc::fork() } {
+                -1 => panic!("fork failed; errno: {}", errno::errno()),
+                0 => {
+                    // I'm the child
+                    fun();
+                    process::exit(0);
+                }
+                child => {
+                    // I'm the parent
+                    let mut status = 0;
+                    if -1 == unsafe { libc::waitpid(child, &mut status, 0) } {
+                        panic!("waitpid failed; errno: {}", errno::errno());
+                    }
+
+                    if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+                        panic!(
+                            "child exited{}",
+                            if libc::WIFEXITED(status) {
+                                format!(" (exit status {})", libc::WEXITSTATUS(status))
+                            } else if libc::WIFSIGNALED(status) {
+                                format!(" (killed by signal {})", libc::WTERMSIG(status))
+                            } else {
+                                String::new()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
 
     fn bench_jvm(
         bencher: &mut Bencher,
@@ -93,36 +132,47 @@ mod tests {
         };
 
         if fork {
-            bencher.iter(|| {
-                match unsafe { libc::fork() } {
-                    -1 => panic!("fork failed; errno: {}", errno::errno()),
-                    0 => {
-                        // I'm the child
-                        test();
-                        process::exit(0);
-                    }
-                    child => {
-                        // I'm the parent
-                        let mut status = 0;
-                        if -1 == unsafe { libc::waitpid(child, &mut status, 0) } {
-                            panic!("waitpid failed; errno: {}", errno::errno());
-                        }
+            bencher.iter(do_fork(test));
+        } else {
+            bencher.iter(test);
+        }
 
-                        if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
-                            panic!(
-                                "child exited{}",
-                                if libc::WIFEXITED(status) {
-                                    format!(" (exit status {})", libc::WEXITSTATUS(status))
-                                } else if libc::WIFSIGNALED(status) {
-                                    format!(" (killed by signal {})", libc::WTERMSIG(status))
-                                } else {
-                                    String::new()
-                                }
-                            )
-                        }
-                    }
-                }
-            });
+        Ok(())
+    }
+
+    fn bench_graalvm_native(
+        bencher: &mut Bencher,
+        class_name: &str,
+        arguments: &[&str],
+        fork: bool,
+    ) -> Result<()> {
+        #[derive(WrapperApi)]
+        struct Api {
+            run_main: fn(argc: c_int, argv: *const *const c_char) -> c_int,
+        }
+
+        let container = unsafe {
+            Container::<Api>::load(&format!("apps/{class_name}/target/{class_name}.so"))
+        }?;
+
+        let test = || {
+            let arguments = iter::once(CString::new(class_name))
+                .chain(arguments.iter().copied().map(CString::new))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            let arguments = arguments.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+
+            let result =
+                container.run_main(arguments.len().try_into().unwrap(), arguments.as_ptr());
+
+            assert!(result == 0);
+        };
+
+        let _gag = Gag::stdout()?;
+
+        if fork {
+            bencher.iter(do_fork(test));
         } else {
             bencher.iter(test);
         }
@@ -167,15 +217,20 @@ mod tests {
     }
 
     macro_rules! benchmarks {
-        ($($jvm:ident $jvm_fork:ident $teavm:ident $name:literal $($args:literal)*,)*) => ($(
+        ($($jvm_direct:ident $jvm_fork:ident $graal_fork:ident $teavm:ident $name:literal $($args:literal)*,)*) => ($(
             #[bench]
-            fn $jvm(bencher: &mut Bencher) -> Result<()> {
+            fn $jvm_direct(bencher: &mut Bencher) -> Result<()> {
                 bench_jvm(bencher, $name, &[$($args,)*], false)
             }
 
             #[bench]
             fn $jvm_fork(bencher: &mut Bencher) -> Result<()> {
                 bench_jvm(bencher, $name, &[$($args,)*], true)
+            }
+
+            #[bench]
+            fn $graal_fork(bencher: &mut Bencher) -> Result<()> {
+                bench_graalvm_native(bencher, $name, &[$($args,)*], true)
             }
 
             #[bench]
@@ -186,11 +241,11 @@ mod tests {
     }
 
     benchmarks! {
-        jvm_mandelbrot jvm_fork_mandelbrot teavm_mandelbrot "mandelbrot" "200",
-        jvm_nbody jvm_fork_nbody teavm_nbody "nbody" "10000",
-        jvm_pidigits jvm_fork_pidigits teavm_pidigits "pidigits" "100",
-        jvm_spectralnorm jvm_fork_spectralnorm teavm_spectralnorm "spectralnorm" "100",
-        jvm_simple jvm_fork_simple teavm_simple "simple" "200",
-        jvm_hello jvm_fork_hello teavm_hello "hello" "hello, world!",
+        jvm_direct_mandelbrot jvm_fork_mandelbrot graalvm_native_fork_mandelbrot teavm_mandelbrot "mandelbrot" "200",
+        jvm_direct_nbody jvm_fork_nbody graalvm_native_fork_nbody teavm_nbody "nbody" "10000",
+        jvm_direct_pidigits jvm_fork_pidigits graalvm_native_fork_pidigits teavm_pidigits "pidigits" "100",
+        jvm_direct_spectralnorm jvm_fork_spectralnorm graalvm_native_fork_spectralnorm teavm_spectralnorm "spectralnorm" "100",
+        jvm_direct_simple jvm_fork_simple graalvm_native_fork_simple teavm_simple "simple" "200",
+        jvm_direct_hello jvm_fork_hello graalvm_native_fork_hello teavm_hello "hello" "hello, world!",
     }
 }
