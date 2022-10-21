@@ -49,15 +49,25 @@ Adjust `LD_LIBRARY_PATH` according to where libjvm.so is in your OpenJDK install
 LD_LIBRARY_PATH=/usr/lib/jvm/java-18-openjdk-amd64/lib/server/ cargo +nightly bench
 ```
 
-### Sample results (Ubuntu 22.04, OpenJDK 18, Intel(R) Core(TM) i7-7600U CPU @ 2.80GHz, 16GB RAM)
+Note that you may want to run the `jvm_fork_*` tests separately since performance varies considerably when
+they are run as a group:
 
 ```
-test tests::graalvm_native_fork_hello        ... bench:   1,610,096 ns/iter (+/- 273,953)
-test tests::graalvm_native_fork_mandelbrot   ... bench:   5,727,398 ns/iter (+/- 710,769)
-test tests::graalvm_native_fork_nbody        ... bench:   3,537,420 ns/iter (+/- 603,914)
-test tests::graalvm_native_fork_pidigits     ... bench:   3,486,886 ns/iter (+/- 429,200)
-test tests::graalvm_native_fork_simple       ... bench:   6,293,284 ns/iter (+/- 706,912)
-test tests::graalvm_native_fork_spectralnorm ... bench:   3,624,850 ns/iter (+/- 765,348)
+export LD_LIBRARY_PATH=/usr/lib/jvm/java-18-openjdk-amd64/lib/server/
+for test in hello mandelbrot nbody pidigits simple spectralnorm; do
+  cargo +nightly bench jvm_fork_$test;
+done
+```
+
+### Sample results (Ubuntu 22.04, OpenJDK 18, GraalVM 21, Intel Core i7-7600U CPU @ 2.80GHz, 16GB RAM)
+
+```
+test tests::graalvm_native_fork_hello        ... bench:   1,318,046 ns/iter (+/- 84,765)
+test tests::graalvm_native_fork_mandelbrot   ... bench:   5,258,110 ns/iter (+/- 82,574)
+test tests::graalvm_native_fork_nbody        ... bench:   3,111,981 ns/iter (+/- 370,911)
+test tests::graalvm_native_fork_pidigits     ... bench:   3,064,349 ns/iter (+/- 125,472)
+test tests::graalvm_native_fork_simple       ... bench:   5,713,054 ns/iter (+/- 266,653)
+test tests::graalvm_native_fork_spectralnorm ... bench:   3,214,552 ns/iter (+/- 155,000)
 
 test tests::jvm_direct_hello                 ... bench:         834 ns/iter (+/- 3,151)
 test tests::jvm_direct_mandelbrot            ... bench:   3,498,878 ns/iter (+/- 78,412)
@@ -66,12 +76,12 @@ test tests::jvm_direct_pidigits              ... bench:     559,801 ns/iter (+/-
 test tests::jvm_direct_simple                ... bench:   3,622,829 ns/iter (+/- 70,974)
 test tests::jvm_direct_spectralnorm          ... bench:   1,439,085 ns/iter (+/- 76,239)
 
-test tests::jvm_fork_hello                   ... bench:   2,120,149 ns/iter (+/- 446,394)
-test tests::jvm_fork_mandelbrot              ... bench:  36,616,057 ns/iter (+/- 13,863,304)
-test tests::jvm_fork_nbody                   ... bench:  48,834,242 ns/iter (+/- 12,484,918)
-test tests::jvm_fork_pidigits                ... bench:  24,822,119 ns/iter (+/- 7,837,427)
-test tests::jvm_fork_simple                  ... bench:  47,904,725 ns/iter (+/- 14,330,855)
-test tests::jvm_fork_spectralnorm            ... bench:  30,455,109 ns/iter (+/- 10,006,388)
+test tests::jvm_fork_hello                   ... bench:   1,078,744 ns/iter (+/- 84,383)
+test tests::jvm_fork_mandelbrot              ... bench:   4,696,560 ns/iter (+/- 292,668)
+test tests::jvm_fork_nbody                   ... bench:   2,601,483 ns/iter (+/- 334,997)
+test tests::jvm_fork_pidigits                ... bench:   6,695,635 ns/iter (+/- 259,430)
+test tests::jvm_fork_simple                  ... bench:   4,739,120 ns/iter (+/- 121,038)
+test tests::jvm_fork_spectralnorm            ... bench:   2,281,307 ns/iter (+/- 61,762)
 
 test tests::teavm_hello                      ... bench:      69,947 ns/iter (+/- 6,950)
 test tests::teavm_mandelbrot                 ... bench:   3,476,083 ns/iter (+/- 285,846)
@@ -80,7 +90,3 @@ test tests::teavm_pidigits                   ... bench:   3,469,015 ns/iter (+/-
 test tests::teavm_simple                     ... bench:   7,162,484 ns/iter (+/- 674,441)
 test tests::teavm_spectralnorm               ... bench:   1,758,527 ns/iter (+/- 293,928)
 ```
-
-### Known Issue(s)
-
-- The `jvm_fork_spectralnorm` test occasionally hangs forever.  If this happens, Ctrl-C and re-run the test.

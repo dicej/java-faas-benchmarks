@@ -18,12 +18,32 @@ mod tests {
         lazy_static::lazy_static,
         std::{
             ffi::{c_char, c_int, CString},
-            iter, process,
+            iter,
         },
         test::Bencher,
         wasmtime::{Config, Engine, Linker, Module, Store},
         wasmtime_wasi::{WasiCtx, WasiCtxBuilder},
     };
+
+    enum Mode {
+        Direct,
+        Fork,
+        ForkWithPrewarm,
+    }
+
+    fn bench(bencher: &mut Bencher, test: impl Fn(), mode: Mode) {
+        match mode {
+            Mode::Direct => bencher.iter(test),
+            Mode::Fork => bencher.iter(do_fork(test)),
+            Mode::ForkWithPrewarm => {
+                for _ in 0..100 {
+                    test();
+                }
+
+                bencher.iter(do_fork(test))
+            }
+        }
+    }
 
     fn do_fork(fun: impl Fn()) -> impl Fn() {
         move || {
@@ -32,7 +52,10 @@ mod tests {
                 0 => {
                     // I'm the child
                     fun();
-                    process::exit(0);
+
+                    // Exit without running any destructors for both maximum performance and to avoid deadlocks
+                    // when disposing the JVM from multiple processes:
+                    unsafe { libc::_exit(0) }
                 }
                 child => {
                     // I'm the parent
@@ -62,7 +85,7 @@ mod tests {
         bencher: &mut Bencher,
         class_name: &str,
         arguments: &[&str],
-        fork: bool,
+        mode: Mode,
     ) -> Result<()> {
         lazy_static! {
             static ref JVM: JavaVM = JavaVM::new(
@@ -105,37 +128,35 @@ mod tests {
         let method = env.get_static_method_id(class, "main", "([Ljava/lang/String;)V")?;
 
         let test = || {
-            let args = env
-                .new_object_array(
-                    arguments.len().try_into().unwrap(),
-                    "java/lang/String",
-                    JObject::null(),
-                )
-                .unwrap();
+            let _ = env
+                .with_local_frame((arguments.len() + 1).try_into().unwrap(), || {
+                    let args = env.new_object_array(
+                        arguments.len().try_into().unwrap(),
+                        "java/lang/String",
+                        JObject::null(),
+                    )?;
 
-            for (index, argument) in arguments.iter().enumerate() {
-                env.set_object_array_element(
-                    args,
-                    index.try_into().unwrap(),
-                    env.new_string(argument).unwrap(),
-                )
-                .unwrap();
-            }
+                    for (index, argument) in arguments.iter().enumerate() {
+                        env.set_object_array_element(
+                            args,
+                            index.try_into().unwrap(),
+                            env.new_string(argument)?,
+                        )?;
+                    }
 
-            env.call_static_method_unchecked(
-                class,
-                method,
-                JavaType::Primitive(Primitive::Void),
-                &[JValue::Object(args.into())],
-            )
-            .unwrap();
+                    env.call_static_method_unchecked(
+                        class,
+                        method,
+                        JavaType::Primitive(Primitive::Void),
+                        &[JValue::Object(args.into())],
+                    )?;
+
+                    Ok(JObject::null())
+                })
+                .unwrap();
         };
 
-        if fork {
-            bencher.iter(do_fork(test));
-        } else {
-            bencher.iter(test);
-        }
+        bench(bencher, test, mode);
 
         Ok(())
     }
@@ -144,7 +165,7 @@ mod tests {
         bencher: &mut Bencher,
         class_name: &str,
         arguments: &[&str],
-        fork: bool,
+        mode: Mode,
     ) -> Result<()> {
         #[derive(WrapperApi)]
         struct Api {
@@ -171,11 +192,7 @@ mod tests {
 
         let _gag = Gag::stdout()?;
 
-        if fork {
-            bencher.iter(do_fork(test));
-        } else {
-            bencher.iter(test);
-        }
+        bench(bencher, test, mode);
 
         Ok(())
     }
@@ -220,17 +237,18 @@ mod tests {
         ($($jvm_direct:ident $jvm_fork:ident $graal_fork:ident $teavm:ident $name:literal $($args:literal)*,)*) => ($(
             #[bench]
             fn $jvm_direct(bencher: &mut Bencher) -> Result<()> {
-                bench_jvm(bencher, $name, &[$($args,)*], false)
+                bench_jvm(bencher, $name, &[$($args,)*], Mode::Direct)
             }
 
             #[bench]
             fn $jvm_fork(bencher: &mut Bencher) -> Result<()> {
-                bench_jvm(bencher, $name, &[$($args,)*], true)
+                bench_jvm(bencher, $name, &[$($args,)*], Mode::ForkWithPrewarm)
             }
 
             #[bench]
             fn $graal_fork(bencher: &mut Bencher) -> Result<()> {
-                bench_graalvm_native(bencher, $name, &[$($args,)*], true)
+                // Prewarming seems to hurt performance in this case, so we just use `Mode::Fork`
+                bench_graalvm_native(bencher, $name, &[$($args,)*], Mode::Fork)
             }
 
             #[bench]
