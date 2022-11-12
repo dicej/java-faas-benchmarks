@@ -6,11 +6,13 @@ fuction-as-a-service (FaaS) environment.  In such an environment, each
 invocation of a function must be isolated from others to ensure security and
 statelessness.
 
-Each case is benchmarked using three different strategies:
+Each case is benchmarked using four different strategies:
 
 - Using OpenJDK's [JNI Invocation API](https://docs.oracle.com/en/java/javase/18/docs/specs/jni/invocation.html).  Each invocation reuses the same JVM.
 
 - As above, but forking a new process for each invocation.
+
+- Using GraalVM's native image compiler, forking a new process for each invocation.
 
 - Using [TeaVM-WASI](https://github.com/fermyon/teavm-wasi) to target WebAssembly, which is run in [Wasmtime](https://github.com/bytecodealliance/wasmtime).  Each invocation uses a new [module instance](https://docs.rs/wasmtime/latest/wasmtime/struct.Instance.html).
 
